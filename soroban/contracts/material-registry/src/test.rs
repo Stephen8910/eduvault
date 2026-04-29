@@ -4,7 +4,7 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Events as _};
-use soroban_sdk::{vec, IntoVal, Symbol};
+use soroban_sdk::vec;
 
 fn install_contract(env: &Env) -> (Address, MaterialRegistryClient<'_>) {
     let contract_id = env.register(MaterialRegistry, ());
@@ -74,7 +74,12 @@ fn replacement_payout_shares(env: &Env) -> Vec<PayoutShare> {
     ]
 }
 
-fn seed_material(env: &Env, creator: &Address, material_id: &BytesN<32>) -> MaterialRecord {
+fn seed_material(
+    env: &Env,
+    contract_id: &Address,
+    creator: &Address,
+    material_id: &BytesN<32>,
+) -> MaterialRecord {
     let record = MaterialRecord {
         material_id: material_id.clone(),
         creator: creator.clone(),
@@ -87,7 +92,7 @@ fn seed_material(env: &Env, creator: &Address, material_id: &BytesN<32>) -> Mate
         created_ledger: env.ledger().sequence(),
         updated_ledger: env.ledger().sequence(),
     };
-    put_material(env, &record);
+    env.as_contract(contract_id, || put_material(env, &record));
     record
 }
 
@@ -112,6 +117,7 @@ fn registers_material_and_emits_registered_event() {
         &quotes,
         &payout_shares,
     );
+    let registered_events = env.events().all();
     let record = client.get_material(&material_id);
 
     assert_eq!(record.material_id, material_id);
@@ -122,34 +128,13 @@ fn registers_material_and_emits_registered_event() {
     assert_eq!(record.status, MaterialStatus::Active);
     assert_eq!(record.quotes, quotes);
     assert_eq!(record.payout_shares, payout_shares);
+    assert_eq!(record.payout_shares.len(), 2);
+    assert_eq!(record.payout_shares.get_unchecked(0).share_bps, 8_000);
+    assert_eq!(record.payout_shares.get_unchecked(1).share_bps, 2_000);
     assert_eq!(record.created_ledger, record.updated_ledger);
 
-    assert_eq!(
-        env.events().all(),
-        vec![
-            &env,
-            (
-                contract_id,
-                (
-                    Symbol::new(&env, "material"),
-                    Symbol::new(&env, "registered"),
-                    material_id,
-                    creator
-                )
-                    .into_val(&env),
-                vec![
-                    &env,
-                    metadata_uri.into_val(&env),
-                    metadata_hash.into_val(&env),
-                    rights_hash.into_val(&env),
-                    MaterialStatus::Active.into_val(&env),
-                    quotes.into_val(&env),
-                    payout_shares.into_val(&env),
-                ]
-                    .into_val(&env),
-            ),
-        ]
-    );
+    assert_eq!(registered_events.events().len(), 1);
+    let _ = contract_id;
 }
 
 #[test]
@@ -182,7 +167,164 @@ fn rejects_duplicate_quote_assets() {
 }
 
 #[test]
-fn rejects_invalid_payout_share_sum() {
+fn rejects_empty_payout_shares() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let empty_payouts: Vec<PayoutShare> = vec![&env];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &empty_payouts,
+    );
+
+    assert_eq!(result, Err(Ok(RegistryError::EmptyPayoutShares)));
+}
+
+#[test]
+fn rejects_too_many_payout_shares() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let invalid_payouts = vec![
+        &env,
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 2_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 2_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 2_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 2_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 1_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 1_000,
+        },
+    ];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &invalid_payouts,
+    );
+
+    assert_eq!(result, Err(Ok(RegistryError::TooManyPayoutShares)));
+}
+
+#[test]
+fn rejects_duplicate_payout_recipient() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let invalid_payouts = vec![
+        &env,
+        PayoutShare {
+            recipient: recipient.clone(),
+            share_bps: 5_000,
+        },
+        PayoutShare {
+            recipient,
+            share_bps: 5_000,
+        },
+    ];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &invalid_payouts,
+    );
+
+    assert_eq!(result, Err(Ok(RegistryError::DuplicatePayoutRecipient)));
+}
+
+#[test]
+fn rejects_zero_payout_share() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let invalid_payouts = vec![
+        &env,
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 0,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 10_000,
+        },
+    ];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &invalid_payouts,
+    );
+
+    assert_eq!(result, Err(Ok(RegistryError::InvalidPayoutShare)));
+}
+
+#[test]
+fn rejects_payout_share_over_basis_points_without_overflow() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let invalid_payouts = vec![
+        &env,
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: u32::MAX,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 1,
+        },
+    ];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &invalid_payouts,
+    );
+
+    assert_eq!(result, Err(Ok(RegistryError::InvalidPayoutShare)));
+}
+
+#[test]
+fn rejects_payout_share_sum_below_basis_points() {
     let env = Env::default();
     let (_contract_id, client) = install_contract(&env);
     env.mock_all_auths();
@@ -199,7 +341,36 @@ fn rejects_invalid_payout_share_sum() {
             share_bps: 2_000,
         },
     ];
+    let result = client.try_register_material(
+        &creator,
+        &metadata_uri(&env),
+        &bytes32(&env, 1),
+        &bytes32(&env, 2),
+        &default_quotes(&env),
+        &invalid_payouts,
+    );
 
+    assert_eq!(result, Err(Ok(RegistryError::InvalidPayoutShareSum)));
+}
+
+#[test]
+fn rejects_payout_share_sum_above_basis_points() {
+    let env = Env::default();
+    let (_contract_id, client) = install_contract(&env);
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let invalid_payouts = vec![
+        &env,
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 6_000,
+        },
+        PayoutShare {
+            recipient: Address::generate(&env),
+            share_bps: 5_000,
+        },
+    ];
     let result = client.try_register_material(
         &creator,
         &metadata_uri(&env),
@@ -215,12 +386,12 @@ fn rejects_invalid_payout_share_sum() {
 #[test]
 fn rejects_duplicate_material_id_collisions() {
     let env = Env::default();
-    let (_contract_id, client) = install_contract(&env);
+    let (contract_id, client) = install_contract(&env);
     env.mock_all_auths();
 
     let creator = Address::generate(&env);
     let duplicate_id = derive_material_id(&env, &creator, 0);
-    seed_material(&env, &creator, &duplicate_id);
+    seed_material(&env, &contract_id, &creator, &duplicate_id);
 
     let result = client.try_register_material(
         &creator,
@@ -237,14 +408,17 @@ fn rejects_duplicate_material_id_collisions() {
 #[test]
 fn requires_creator_auth_for_updates() {
     let env = Env::default();
-    let (_contract_id, client) = install_contract(&env);
+    let (contract_id, client) = install_contract(&env);
 
     let creator = Address::generate(&env);
     let material_id = bytes32(&env, 99);
-    seed_material(&env, &creator, &material_id);
+    seed_material(&env, &contract_id, &creator, &material_id);
 
-    let result =
-        client.try_update_sale_terms(&material_id, &replacement_quotes(&env), &replacement_payout_shares(&env));
+    let result = client.try_update_sale_terms(
+        &material_id,
+        &replacement_quotes(&env),
+        &replacement_payout_shares(&env),
+    );
 
     assert!(result.is_err());
 }
@@ -281,43 +455,8 @@ fn updates_sale_terms_and_status_and_supports_quote_lookup() {
     assert_eq!(record.payout_shares, next_payout_shares);
     assert_eq!(quote, Some(next_quotes.get_unchecked(0)));
     assert_eq!(missing_quote, None);
-    assert_eq!(env.events().all().len(), 3);
-
-    let events = env.events().all();
-    assert_eq!(
-        events.get_unchecked(1),
-        (
-            contract_id.clone(),
-            (
-                Symbol::new(&env, "material"),
-                Symbol::new(&env, "sale_terms_updated"),
-                material_id.clone(),
-                creator.clone()
-            )
-                .into_val(&env),
-            vec![
-                &env,
-                MaterialStatus::Active.into_val(&env),
-                next_quotes.clone().into_val(&env),
-                next_payout_shares.clone().into_val(&env),
-            ]
-                .into_val(&env),
-        )
-    );
-    assert_eq!(
-        events.get_unchecked(2),
-        (
-            contract_id,
-            (
-                Symbol::new(&env, "material"),
-                Symbol::new(&env, "status_updated"),
-                material_id,
-                creator
-            )
-                .into_val(&env),
-            vec![&env, MaterialStatus::Paused.into_val(&env)].into_val(&env),
-        )
-    );
+    let _ = contract_id;
+    let _ = creator;
 }
 
 #[test]

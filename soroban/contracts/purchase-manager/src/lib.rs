@@ -7,6 +7,7 @@ use soroban_sdk::{
 
 const BASIS_POINTS: u32 = 10_000;
 const MAX_PLATFORM_FEE_BPS: u32 = 1_000;
+const MAX_PAYOUT_RECIPIENTS: u32 = 5;
 
 /// Material status from registry (replicated here to avoid circular deps)
 #[contracttype]
@@ -166,15 +167,26 @@ pub struct PurchaseManager;
 
 /// Interface for calling MaterialRegistry contract
 pub trait MaterialRegistryInterface {
-    fn get_material(env: &Env, material_id: &BytesN<32>) -> Result<MaterialRecord, PurchaseError>;
+    fn get_material(
+        &self,
+        env: &Env,
+        material_id: &BytesN<32>,
+    ) -> Result<MaterialRecord, PurchaseError>;
 }
 
 /// Interface implementation using cross-contract call
 impl MaterialRegistryInterface for Address {
-    fn get_material(env: &Env, material_id: &BytesN<32>) -> Result<MaterialRecord, PurchaseError> {
+    fn get_material(
+        &self,
+        env: &Env,
+        material_id: &BytesN<32>,
+    ) -> Result<MaterialRecord, PurchaseError> {
         let func = Symbol::new(env, "get_material");
-        let result: Result<MaterialRecord, PurchaseError> = env
-            .invoke_contract(self, &func, Vec::from_array(env, [material_id.into_val(env)]));
+        let result: Result<MaterialRecord, PurchaseError> = env.invoke_contract(
+            self,
+            &func,
+            Vec::from_array(env, [material_id.into_val(env)]),
+        );
         result.map_err(|_| PurchaseError::RegistryCallFailed)
     }
 }
@@ -209,18 +221,18 @@ impl PurchaseManager {
 
         let config = PlatformConfig {
             registry,
-            treasury,
+            treasury: treasury.clone(),
             platform_fee_bps,
             paused: false,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
         env.storage()
             .persistent()
             .set(&DataKey::PlatformConfig, &config);
-        env.storage().persistent().set(&DataKey::PurchaseNonce, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PurchaseNonce, &0u64);
 
         // Emit config event
         PlatformConfigUpdatedEvent {
@@ -287,6 +299,8 @@ impl PurchaseManager {
             return Err(PurchaseError::InvalidQuoteAmount);
         }
 
+        validate_payout_shares(&material.payout_shares)?;
+
         // Calculate payout amounts
         let gross = quote.amount;
         let platform_fee = (gross * config.platform_fee_bps as i128) / BASIS_POINTS as i128;
@@ -300,7 +314,7 @@ impl PurchaseManager {
         // 1. Transfer platform fee to treasury
         if platform_fee > 0 {
             transfer_asset(&env, &buyer, &config.treasury, &asset, platform_fee)?;
-            
+
             // Emit treasury payout event
             PayoutDistributedEvent {
                 purchase_id,
@@ -370,9 +384,7 @@ impl PurchaseManager {
 
     /// Get current platform configuration
     pub fn get_platform_config(env: Env) -> Option<PlatformConfig> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PlatformConfig)
+        env.storage().persistent().get(&DataKey::PlatformConfig)
     }
 
     /// Check if an asset is globally allowed for purchases
@@ -430,7 +442,7 @@ impl PurchaseManager {
 
         let new_config = PlatformConfig {
             registry: current_config.registry,
-            treasury,
+            treasury: treasury.clone(),
             platform_fee_bps,
             paused,
         };
@@ -451,11 +463,7 @@ impl PurchaseManager {
     }
 
     /// Update registry address (admin only, for migrations)
-    pub fn set_registry(
-        env: Env,
-        admin: Address,
-        registry: Address,
-    ) -> Result<(), PurchaseError> {
+    pub fn set_registry(env: Env, admin: Address, registry: Address) -> Result<(), PurchaseError> {
         admin.require_auth();
         verify_admin(&env, &admin)?;
 
@@ -546,14 +554,46 @@ fn transfer_asset(
     let func = Symbol::new(env, "transfer");
     let args = Vec::from_array(
         env,
-        [
-            from.into_val(env),
-            to.into_val(env),
-            amount.into_val(env),
-        ],
+        [from.into_val(env), to.into_val(env), amount.into_val(env)],
     );
-    
+
     env.invoke_contract::<()>(asset, &func, args);
+    Ok(())
+}
+
+fn validate_payout_shares(payout_shares: &Vec<PayoutShare>) -> Result<(), PurchaseError> {
+    let share_count = payout_shares.len();
+    if share_count == 0 || share_count > MAX_PAYOUT_RECIPIENTS {
+        return Err(PurchaseError::InvalidPayoutShares);
+    }
+
+    let mut total_share_bps = 0u32;
+    let mut index = 0;
+    while index < share_count {
+        let share = payout_shares.get_unchecked(index);
+        if share.share_bps == 0 || share.share_bps > BASIS_POINTS {
+            return Err(PurchaseError::InvalidPayoutShares);
+        }
+
+        total_share_bps = total_share_bps
+            .checked_add(share.share_bps)
+            .ok_or(PurchaseError::InvalidPayoutShares)?;
+
+        let mut other = index + 1;
+        while other < share_count {
+            if share.recipient == payout_shares.get_unchecked(other).recipient {
+                return Err(PurchaseError::InvalidPayoutShares);
+            }
+            other += 1;
+        }
+
+        index += 1;
+    }
+
+    if total_share_bps != BASIS_POINTS {
+        return Err(PurchaseError::InvalidPayoutShares);
+    }
+
     Ok(())
 }
 
@@ -568,11 +608,12 @@ fn distribute_payout_shares(
 ) -> Result<(), PurchaseError> {
     let mut total_distributed: i128 = 0;
     let share_count = payout_shares.len();
-    
+    let creator_share_role = Symbol::new(env, "creator_share");
+
     let mut index = 0;
     while index < share_count {
         let share = payout_shares.get_unchecked(index);
-        
+
         // Calculate share amount
         let share_amount = if index == share_count - 1 {
             // Last recipient gets remaining to avoid rounding errors
@@ -591,7 +632,7 @@ fn distribute_payout_shares(
                 purchase_id,
                 material_id: material_id.clone(),
                 recipient: share.recipient.clone(),
-                role: Symbol::new(env, "creator_share"),
+                role: creator_share_role.clone(),
                 asset: asset.clone(),
                 amount: share_amount,
             }
